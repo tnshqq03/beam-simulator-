@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>3D Beam Deformation Simulator</title>
+<!--
+ 3D Beam Deformation Simulator  |  CA 3 Case Study – Strength of Materials and Testing (SOM&T)
+ Tools: HTML5 + JavaScript (ES6), Three.js r128 (3D/WebGL), Canvas 2D API.
+ Method: Euler–Bernoulli beam, Hermite-cubic finite elements (own solver, no library), statics for V and M.
+-->
+<style>
+*{box-sizing:border-box}
+:root{--bg:#071423;--pn:#0c1d33;--ln:#1d3a5e;--ink:#dce9f6;--mu:#84a0bd;--ac:#3de0ff;--am:#ffb347}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:13px/1.45 "Segoe UI","Avenir Next",Roboto,sans-serif}
+body{display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:14px;padding:8px 14px;border-bottom:1px solid var(--ln);background:#0a182b}
+header b{font-size:18px;color:var(--ac);letter-spacing:.3px}header span{color:var(--mu);flex:1}
+nav{display:flex;gap:6px;padding:6px 14px;overflow-x:auto;border-bottom:1px solid var(--ln);background:#091728}
+button,select{background:#11294a;color:var(--ink);border:1px solid var(--ln);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer}
+nav button{white-space:nowrap}button:hover,select:hover{border-color:var(--ac)}select{width:100%}
+main{flex:1;display:grid;grid-template-columns:300px 1fr 350px;min-height:0}
+aside{overflow:auto;padding:4px 12px 14px;background:var(--pn)}
+#ctl{border-right:1px solid var(--ln)}#out{border-left:1px solid var(--ln)}
+h4{margin:14px 0 6px;padding-bottom:3px;border-bottom:1px solid var(--ln);color:var(--ac);font-size:13px;font-weight:600}
+.r,.s,.c{margin:6px 0}.r{display:grid;grid-template-columns:1fr auto;gap:0 8px}.r input{grid-column:1/3;width:100%;accent-color:var(--ac)}
+.r output{color:var(--am);font-variant-numeric:tabular-nums}.s label{display:block;color:var(--mu);margin-bottom:2px}
+.c label{display:flex;gap:8px;align-items:center}
+#view{position:relative;background:radial-gradient(ellipse at 50% 35%,#12335c 0,#071423 72%);min-height:380px}
+#gl{width:100%;height:100%;display:block;touch-action:none}
+#hud{position:absolute;left:12px;top:10px;color:var(--mu);font-size:12px;pointer-events:none}
+#lg{position:absolute;left:12px;bottom:12px;width:240px;font-size:11px;color:var(--mu)}
+#lg i{display:block;height:9px;border-radius:5px;background:linear-gradient(90deg,#3de0ff,#e9f0f7,#ff4d5e)}
+#lg div{display:flex;justify-content:space-between;margin-top:2px}
+#kpi{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.k{background:#0a1829;border:1px solid var(--ln);border-radius:6px;padding:5px 8px}.k small{display:block;color:var(--mu)}.k b{font-weight:600}
+.ok{color:#6ee7a0}.bad{color:#ff6b7a}
+canvas.ch{width:100%;height:118px;display:block;border:1px solid var(--ln);border-radius:6px}
+#kpi.f .k{animation:fl .8s ease-out}@keyframes fl{from{background:#164c78;border-color:var(--ac)}}
+pre{margin:0;color:var(--mu);font:11px/1.55 Consolas,monospace;white-space:pre-wrap}
+@media(max-width:1000px){body{overflow:auto;height:auto}main{display:block}#view{height:62vh}aside{border:0!important}}
+</style></head><body>
+<header><b>3D Beam Deformation Simulator</b><span>Euler–Bernoulli finite elements · live stress cloud</span><button id="shot">Save snapshot</button></header>
+<nav id="sc"></nav>
+<main>
+<aside id="ctl"></aside>
+<section id="view"><canvas id="gl"></canvas><div id="hud"></div>
+<div id="lg"><i></i><div><span id="l0"></span><span>0</span><span id="l1"></span></div></div></section>
+<aside id="out">
+<h4>Results</h4><div id="kpi"></div>
+<h4>Support reactions</h4><div id="rx"></div>
+<h4>Shear force diagram</h4><canvas class="ch" id="c1"></canvas>
+<h4>Bending moment diagram</h4><canvas class="ch" id="c2"></canvas>
+<h4>Elastic curve</h4><canvas class="ch" id="c3"></canvas>
+<h4>Bending stress across the section</h4><canvas class="ch" id="c4" style="height:150px"></canvas>
+<h4>Equations used</h4><pre>EI·d²y/dx² = −M(x)      (y down, M sagging +)
+σ = −M·y / I             ε = σ / E
+lateral strain = −ν·ε    G = E / 2(1+ν)
+FEM: [K]{d} = {F},  K = (EI/l³)·Hermite matrix</pre>
+</aside>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+//<SOLVER>
+const MAT={Steel:[200,.30,250],Aluminium:[69,.33,275],Titanium:[110,.34,880],Brass:[100,.34,200],'Cast iron':[100,.26,200],Timber:[11,.35,40]};
+const S={beam:'cant',sec:'rect',L:2,p1:50,p2:80,p3:6,mat:'Steel',E:200,nu:.3,sy:250,P:5,a:2,w:0,wu:0,auto:1,lk:2,ghost:1,cloud:1,pulse:0,damp:.4,probe:1};
+const NS=121;let cur,ST;
+function section(){const m=1e-3,{p1,p2,p3}=S;let o;
+ if(S.sec=='rect'){const w=p1*m/2,h=p2*m/2;o={loops:[[[h,w],[h,-w],[-h,-w],[-h,w]]],A:4*w*h,I:4*w*h**3/3,c:h}}
+ else if(S.sec=='circ'||S.sec=='tube'){const ro=p1*m/2,ri=S.sec=='tube'?Math.max(ro-p3*m,ro*.1):0,ring=r=>Array.from({length:40},(_,i)=>[r*Math.cos(i*Math.PI/20),r*Math.sin(i*Math.PI/20)]);
+  o={loops:ri?[ring(ro),ring(ri)]:[ring(ro)],A:Math.PI*(ro*ro-ri*ri),I:Math.PI*(ro**4-ri**4)/4,c:ro}}
+ else{const b=p1*m/2,h=p2*m/2,T=Math.min(p3*m,h*.8,b*1.6),t=T/2;
+  o={loops:[[[h,-b],[h,b],[h-T,b],[h-T,t],[-h+T,t],[-h+T,b],[-h,b],[-h,-b],[-h+T,-b],[-h+T,-t],[h-T,-t],[h-T,-b]]],
+   A:4*b*T+2*t*(2*h-2*T),I:(2*b*(2*h)**3-(2*b-2*t)*(2*h-2*T)**3)/12,c:h}}
+ return o}
+function solve(){
+ const sc=cur=section(),E=S.E*1e9,EI=E*sc.I,L=S.L,P=S.P*1e3,w=S.w*1e3,wu=S.wu*1e3,a=S.a;
+ const X=[];for(let i=0;i<=48;i++)X.push(L*i/48);
+ if(P&&!X.some(x=>Math.abs(x-a)<1e-9))X.push(a);X.sort((p,q)=>p-q);
+ const n=X.length,N=2*n,K=Array.from({length:N},()=>new Float64Array(N)),f=new Float64Array(N);
+ for(let e=0;e<n-1;e++){const l=X[e+1]-X[e],c=EI/l**3;
+  const k=[[12,6*l,-12,6*l],[6*l,4*l*l,-6*l,2*l*l],[-12,-6*l,12,-6*l],[6*l,2*l*l,-6*l,4*l*l]];
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++)K[2*e+i][2*e+j]+=c*k[i][j];
+  const q1=w+wu*X[e]/L,q2=w+wu*X[e+1]/L;               // consistent nodal loads of a linearly varying load
+  f[2*e]+=l*(7*q1+3*q2)/20;f[2*e+1]+=l*l*(3*q1+2*q2)/60;f[2*e+2]+=l*(3*q1+7*q2)/20;f[2*e+3]-=l*l*(2*q1+3*q2)/60}
+ if(P)f[2*X.findIndex(x=>Math.abs(x-a)<1e-9)]+=P;
+ const last=2*(n-1),cons={cant:[0,1],ss:[0,last],ff:[0,1,last,last+1],prop:[0,1,last]}[S.beam];
+ const fr=[...Array(N).keys()].filter(i=>!cons.includes(i)),m=fr.length;
+ const A=fr.map(i=>Array.from(fr,j=>K[i][j]).concat(f[i])),d=new Float64Array(N);
+ for(let i=0;i<m;i++){let p=i;for(let r=i+1;r<m;r++)if(Math.abs(A[r][i])>Math.abs(A[p][i]))p=r;[A[i],A[p]]=[A[p],A[i]];
+  for(let r=i+1;r<m;r++){const g=A[r][i]/A[i][i];if(g)for(let c=i;c<=m;c++)A[r][c]-=g*A[i][c]}}
+ for(let i=m-1;i>=0;i--){let s=A[i][m];for(let j=i+1;j<m;j++)s-=A[i][j]*d[fr[j]];d[fr[i]]=s/A[i][i]}
+ const hv=x=>{let e=0;while(e<n-2&&x>X[e+1])e++;const l=X[e+1]-X[e],s=(x-X[e])/l,D=[d[2*e],d[2*e+1],d[2*e+2],d[2*e+3]];
+  return[D[0]*(1-3*s*s+2*s**3)+D[1]*l*(s-2*s*s+s**3)+D[2]*(3*s*s-2*s**3)+D[3]*l*(s**3-s*s),
+   (D[0]*(-6*s+6*s*s)+D[2]*(6*s-6*s*s))/l+D[1]*(1-4*s+3*s*s)+D[3]*(3*s*s-2*s)]};
+ const rea=cons.map(i=>{let r=-f[i];for(let j=0;j<N;j++)r+=K[i][j]*d[j];return i%2?{x:X[i>>1],F:0,M:r}:{x:X[i>>1],F:-r,M:0}});
+ const VM=x=>{let V=0,M=0;
+  rea.forEach(R=>{if(R.x<x||R.x<1e-12){V+=R.F;M+=R.F*(x-R.x)+R.M}});
+  if(x>a+1e-9){V-=P;M-=P*(x-a)}
+  V-=w*x+wu*x*x/(2*L);M-=w*x*x/2+wu*x**3/(6*L);return[V,M]};
+ const ser={x:[],V:[],M:[],v:[],th:[]};
+ for(let i=0;i<NS;i++){const x=L*i/(NS-1),[v,t]=hv(x),[V,M]=VM(x);ser.x.push(x);ser.V.push(V);ser.M.push(M);ser.v.push(v);ser.th.push(t)}
+ const am=Z=>Z.reduce((b,c,i)=>Math.abs(c)>Math.abs(Z[b])?i:b,0),iv=am(ser.v),im=am(ser.M);
+ ST={ser,hv,rea,E,dmax:ser.v[iv],xd:ser.x[iv],thmax:ser.th[am(ser.th)],Mmax:ser.M[im],xm:ser.x[im],Vmax:ser.V[am(ser.V)],smax:Math.abs(ser.M[im])*sc.c/sc.I};
+ ST.fos=ST.smax>0?S.sy*1e6/ST.smax:Infinity;
+ ST.kAuto=Math.abs(ST.dmax)>1e-12?Math.min(.12*L/Math.abs(ST.dmax),1e6):1}
+//</SOLVER>
+
+const $=s=>document.querySelector(s),fmt=v=>{const a=Math.abs(v);return a<1e-7?'0':a>=100?v.toFixed(0):a>=1?v.toFixed(2):a>=.01?v.toFixed(3):v.toExponential(1)};
+const pi=()=>Math.round(S.probe/S.L*(NS-1));
+const SC={
+ 'Diving board':{beam:'cant',sec:'rect',L:2,p1:50,p2:80,p3:6,mat:'Steel',P:5,a:2,w:0,wu:0},
+ 'Bridge girder':{beam:'ss',sec:'ibeam',L:4,p1:100,p2:200,p3:8,mat:'Steel',P:0,a:2,w:10,wu:0},
+ 'Fixed–fixed, ramp load':{beam:'ff',sec:'tube',L:3,p1:80,p2:80,p3:6,mat:'Aluminium',P:0,a:1.5,w:0,wu:12},
+ 'Propped shaft':{beam:'prop',sec:'circ',L:2.5,p1:60,p2:80,p3:6,mat:'Titanium',P:8,a:1.25,w:4,wu:0},
+ 'Timber plank':{beam:'ss',sec:'rect',L:3,p1:150,p2:50,p3:6,mat:'Timber',P:1.5,a:1.5,w:0,wu:0}};
+const UI=[['h','Component'],['sel','beam','Beam and supports',{cant:'Cantilever (fixed–free)',ss:'Simply supported',ff:'Fixed–fixed',prop:'Propped cantilever'}],
+ ['sel','sec','Cross-section',{rect:'Rectangular',circ:'Circular (solid)',ibeam:'I-section',tube:'Hollow tube'}],
+ ['h','Geometry'],['rng','L','Length L',.5,6,.1,'m'],['rng','p1','',10,200,1,'mm'],['rng','p2','',10,300,1,'mm'],['rng','p3','',2,40,1,'mm'],
+ ['h','Material'],['sel','mat','Preset',Object.fromEntries(Object.keys(MAT).map(k=>[k,k]))],['rng','E',"Young's modulus E",.05,400,.05,'GPa'],
+ ['rng','nu',"Poisson's ratio ν",.05,.49,.01,''],['rng','sy','Yield strength σy',5,1000,5,'MPa'],
+ ['h','Loads (downward)'],['rng','P','Point load P',0,50,.5,'kN'],['rng','a','Point load position a',0,6,.05,'m'],['rng','w','UDL intensity w',0,50,.5,'kN/m'],['rng','wu','UVL peak w₀ (0 → w₀)',0,50,.5,'kN/m'],
+ ['h','View'],['chk','auto','Fixed exaggeration (fitted on scenario / beam change)'],['rng','lk','Manual exaggeration (10^x)',0,4,.1,''],['chk','ghost','Show original shape'],['chk','cloud','Stress colour cloud'],['chk','pulse','Pulse the loading'],['rng','damp','Dynamics: wobbly ↔ smooth',0,1,.05,''],['rng','probe','Probe cut position x',0,6,.01,'m']];
+const PL={rect:['Width b','Depth h',0],circ:['Diameter D',0,0],ibeam:['Flange width b','Depth h','Thickness t'],tube:['Outer diameter D',0,'Wall thickness t']};
+const el={},light=['probe','lk','auto','ghost','cloud','pulse','damp'];let prevL=S.L;
+UI.forEach(([t,k,l,...r])=>{if(t=='h'){$('#ctl').insertAdjacentHTML('beforeend',`<h4>${k}</h4>`);return}
+ const d=document.createElement('div');
+ if(t=='sel'){d.className='s';d.innerHTML=`<label>${l}</label><select>${Object.entries(r[0]).map(([a,b])=>`<option value="${a}">${b}</option>`).join('')}</select>`;
+  const e=el[k]=d.querySelector('select');e.onchange=()=>{S[k]=e.value;if(k=='mat')[S.E,S.nu,S.sy]=MAT[S.mat];run(k)}}
+ else if(t=='chk'){d.className='c';d.innerHTML=`<label><input type=checkbox>${l}</label>`;const e=el[k]=d.querySelector('input');e.onchange=()=>{S[k]=e.checked?1:0;run(k)}}
+ else{d.className='r';d.innerHTML=`<label>${l}</label><output></output><input type=range min=${r[0]} max=${r[1]} step=${r[2]}>`;
+  const e=el[k]=d.querySelector('input');e._o=d.querySelector('output');e._u=r[3];e._l=d.querySelector('label');e.oninput=()=>{S[k]=+e.value;run(k)}}
+ $('#ctl').appendChild(d)});
+function syncUI(){for(const k in el){const e=el[k];if(e.type=='checkbox')e.checked=!!S[k];else e.value=S[k];if(e._o)e._o.textContent=(+(+S[k]).toFixed(2))+(e._u?' '+e._u:'')}}
+function relabel(){const p=PL[S.sec];['p1','p2','p3'].forEach((k,i)=>{el[k].parentNode.style.display=p[i]?'':'none';if(p[i])el[k]._l.textContent=p[i]})}
+
+/* ---------- 3D scene ---------- */
+const gl=$('#gl'),R3=new THREE.WebGLRenderer({canvas:gl,antialias:true,alpha:true}),scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(40,1,.01,200);
+R3.setPixelRatio(Math.min(devicePixelRatio,2));
+scene.add(new THREE.AmbientLight(0x9db8e0,.75));
+const dl=new THREE.DirectionalLight(0xffffff,.9);dl.position.set(3,6,5);scene.add(dl);
+const dl2=new THREE.DirectionalLight(0x6fa8ff,.4);dl2.position.set(-4,-2,-3);scene.add(dl2);
+const env=new THREE.Group(),loads=new THREE.Group();scene.add(env,loads);
+const mat=new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.55,metalness:.15,side:THREE.DoubleSide});
+const plane=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshBasicMaterial({color:0xffd166,transparent:true,opacity:.35,depthWrite:false}));scene.add(plane);
+let mesh,ghost,axis,geo,anim=0,tgtA=1,th=-.55,ph=1.2,R=2.4,tpos,tcol,pos,col,vel,moving=0,pl,PT,lt=0,kFix=1,refit=1;
+const clr=g=>{while(g.children.length){const o=g.children.pop();if(o.geometry)o.geometry.dispose()}};
+function cam(){const t=new THREE.Vector3(S.L/2,0,0);camera.position.set(t.x+R*Math.sin(ph)*Math.sin(th),R*Math.cos(ph),R*Math.sin(ph)*Math.cos(th));camera.lookAt(t)}
+const ptr=new Map();let pd=0;
+gl.onpointerdown=e=>{gl.setPointerCapture(e.pointerId);ptr.set(e.pointerId,e)};
+gl.onpointermove=e=>{const o=ptr.get(e.pointerId);if(!o)return;ptr.set(e.pointerId,e);
+ if(ptr.size==1){th-=(e.clientX-o.clientX)*.007;ph=Math.min(3,Math.max(.15,ph-(e.clientY-o.clientY)*.007))}
+ else{const[p,q]=[...ptr.values()],d=Math.hypot(p.clientX-q.clientX,p.clientY-q.clientY);if(pd)R*=pd/d;pd=d}cam()};
+gl.onpointerup=gl.onpointercancel=e=>{ptr.delete(e.pointerId);pd=0};
+gl.onwheel=e=>{e.preventDefault();R*=1+Math.sign(e.deltaY)*.08;cam()};
+
+function fillTo(P,C,k){const s=ST,sm=Math.max(s.smax,1e-9);let q=0;
+ cur.loops.forEach(l=>{for(let i=0;i<NS;i++){const x=s.ser.x[i],M=s.ser.M[i],t=s.ser.th[i],v=s.ser.v[i];
+  for(const[y,z]of l){const sg=-M*y/cur.I,u=Math.max(-1,Math.min(1,sg/sm)),pf=Math.min(1.8,Math.max(.3,1-S.nu*sg/s.E*k));
+   P[q*3]=x+y*t*k;P[q*3+1]=y-v*k;P[q*3+2]=z*pf;                 // plane sections stay plane; Poisson narrows the tension side
+   const a=u<0?[.24,.88,1]:[1,.3,.37],b=[.91,.94,.97],w=Math.abs(u);
+   if(S.cloud){for(let c=0;c<3;c++)C[q*3+c]=b[c]+(a[c]-b[c])*w}else{C[q*3]=.6;C[q*3+1]=.7;C[q*3+2]=.82}q++}}});
+}
+function rebuild(){const sc=cur,ind=[],bases=[];let base=0;
+ sc.loops.forEach(l=>{const m=l.length;bases.push(base);
+  for(let i=0;i<NS-1;i++)for(let j=0;j<m;j++){const j2=(j+1)%m,A=base+i*m+j,B=base+i*m+j2,C=base+(i+1)*m+j,D=base+(i+1)*m+j2;ind.push(A,C,B,B,C,D)}base+=NS*m});
+ const pts=sc.loops.map(l=>l.map(p=>new THREE.Vector2(p[1],p[0]))),map=[];sc.loops.forEach((l,li)=>l.forEach((_,j)=>map.push([li,j])));
+ const tri=THREE.ShapeUtils.triangulateShape(pts[0].slice(),pts.slice(1).map(h=>h.slice()));     // end caps
+ [0,NS-1].forEach(i=>tri.forEach(t=>t.forEach(q=>{const[li,j]=map[q];ind.push(bases[li]+i*sc.loops[li].length+j)})));
+ [mesh,ghost,axis].forEach(o=>{if(o){scene.remove(o);o.geometry.dispose()}});
+ const n=base*3,keep=pos&&pos.length==n;                      // same section type: morph from the old shape
+ tpos=new Float32Array(n);tcol=new Float32Array(n);fillTo(tpos,tcol,0);
+ if(!keep){pos=tpos.slice();col=tcol.slice();vel=new Float32Array(n)}
+ geo=new THREE.BufferGeometry();geo.setIndex(ind);geo.setAttribute('position',new THREE.BufferAttribute(pos,3));geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+ mesh=new THREE.Mesh(geo,mat);mesh.frustumCulled=false;scene.add(mesh);
+ const g0=new THREE.BufferGeometry();g0.setIndex(ind);g0.setAttribute('position',new THREE.BufferAttribute(tpos.slice(),3));
+ ghost=new THREE.LineSegments(new THREE.EdgesGeometry(g0,25),new THREE.LineBasicMaterial({color:0x3de0ff,transparent:true,opacity:.8}));scene.add(ghost);g0.dispose();
+ axis=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0),new THREE.Vector3(S.L,0,0)]),new THREE.LineBasicMaterial({color:0x3de0ff,transparent:true,opacity:.6}));scene.add(axis)}
+function buildLoads(){const old={};loads.children.forEach(a=>old[a.userData.key]=a.userData);clr(loads);const L=S.L;
+ const add=(key,x,len,col)=>{const a=new THREE.ArrowHelper(new THREE.Vector3(0,-1,0),new THREE.Vector3(x,0,0),len,col,len*.35,len*.16),o=old[key];
+  a.userData=o?{...o,x,len}:{x,len,ty:cur.c,dx:x,dy:cur.c,dl:0};a.userData.key=key;loads.add(a)};   // new arrows grow in, old ones slide and resize
+ if(S.P>0)add('P',S.a,.24*L,0xffb347);
+ if(S.w>0)for(let i=0;i<=10;i++)add('U'+i,L*i/10,.1*L,0xffe066);
+ if(S.wu>0)for(let i=1;i<=10;i++)add('V'+i,L*i/10,.03*L+.17*L*i/10,0xff7ad9)}
+function buildEnv(){clr(env);const L=S.L,c=cur.c,H=Math.max(8*c,.12*L),gm=new THREE.MeshStandardMaterial({color:0x2c4a73,roughness:.8});
+ const wall=x=>{const m=new THREE.Mesh(new THREE.BoxGeometry(.05*L,H,H),gm);m.position.set(x,0,0);env.add(m)};
+ const pin=x=>{const m=new THREE.Mesh(new THREE.ConeGeometry(.04*L,.07*L,24),gm);m.position.set(x,-c-.035*L,0);env.add(m)};
+ const right={cant:0,ss:'p',ff:'w',prop:'p'}[S.beam];
+ S.beam=='ss'?pin(0):wall(-.025*L);if(right)right=='w'?wall(1.025*L):pin(L);
+ const sz=Math.max(12,L*4),g=new THREE.GridHelper(sz,sz*2,0x3de0ff,0x1d3a5e);g.position.set(L/2,-c-.075*L,0);g.material.transparent=true;g.material.opacity=.4;env.add(g)}
+const kBase=()=>S.auto?Math.min(kFix,.45*S.L/Math.max(Math.abs(ST.dmax),1e-12)):Math.pow(10,S.lk);
+function draw(){const k=kBase()*anim;fillTo(tpos,tcol,k);moving=1;ghost.visible=!!S.ghost;
+ loads.children.forEach(a=>{a.userData.ty=cur.c-ST.hv(a.userData.x)[0]*k});
+ const i=pi(),zm=Math.max(...cur.loops.flat().map(p=>Math.abs(p[1])));
+ PT={x:ST.ser.x[i],y:-ST.ser.v[i]*k,rz:-ST.ser.th[i]*k,sx:S.L*.006,sy:2.6*cur.c,sz:2.6*zm};if(!pl)pl={...PT};
+ $('#hud').innerHTML=`Displacements drawn ×${fmt(kBase())}${S.auto?(kBase()<kFix?' (capped)':' (held)'):''} · true max deflection ${fmt(ST.dmax*1e3)} mm<br>drag to orbit · wheel or pinch to zoom · yellow plate = probe cut`}
+/* ---------- spring dynamics: everything glides to its new state and settles with a wobble ---------- */
+const spr=(o,k,t,dt)=>{const Cd=4+22*S.damp,v=(o[k+'v']||0)+((t-o[k])*120-(o[k+'v']||0)*Cd)*dt;o[k+'v']=v;o[k]+=v*dt};
+function stepAll(dt){if(!geo)return;const Cd=4+22*S.damp,h=dt/2;
+ if(moving){let me=0;
+  for(let q=0;q<2;q++)for(let i=0;i<pos.length;i++){vel[i]+=((tpos[i]-pos[i])*120-vel[i]*Cd)*h;pos[i]+=vel[i]*h}
+  for(let i=0;i<pos.length;i++){me=Math.max(me,Math.abs(tpos[i]-pos[i])+Math.abs(vel[i])*.05+Math.abs(tcol[i]-col[i])*S.L*.01);col[i]+=(tcol[i]-col[i])*Math.min(1,dt*9)}
+  if(me<2e-5*S.L){pos.set(tpos);col.set(tcol);vel.fill(0);moving=0}
+  geo.attributes.position.needsUpdate=geo.attributes.color.needsUpdate=true}
+ loads.children.forEach(a=>{const u=a.userData;spr(u,'dx',u.x,dt);spr(u,'dy',u.ty,dt);spr(u,'dl',u.len,dt);const l=Math.max(u.dl,1e-4);
+  a.position.set(u.dx,u.dy+l,0);a.setLength(l,l*.35,l*.16);a.visible=u.dl>.004*S.L});
+ if(pl&&PT){['x','y','rz','sx','sy','sz'].forEach(k=>spr(pl,k,PT[k],dt));plane.position.set(pl.x,pl.y,0);plane.rotation.z=pl.rz;plane.scale.set(Math.max(pl.sx,1e-4),Math.max(pl.sy,1e-4),Math.max(pl.sz,1e-4))}
+ stepCharts(dt)}
+const CS={t:null,d:null,v:null,moving:0};
+function setCharts(){const s=ST,t=[s.ser.V.map(v=>v/1e3),s.ser.M.map(v=>v/1e3),s.ser.v.map(v=>v*1e3)];
+ CS.t=t;if(!CS.d){CS.d=t.map(a=>Float64Array.from(a));CS.v=t.map(a=>new Float64Array(a.length))}CS.moving=1}
+function stepCharts(dt){if(!CS.moving)return;let err=0;const Cd=4+22*S.damp;
+ CS.d.forEach((a,j)=>{const t=CS.t[j],v=CS.v[j],sc=Math.max(...t.map(Math.abs),1e-9);
+  for(let i=0;i<a.length;i++){const e=t[i]-a[i];v[i]+=(e*120-v[i]*Cd)*dt;a[i]+=v[i]*dt;err=Math.max(err,(Math.abs(e)+Math.abs(v[i])*.05)/sc)}});
+ if(err<1e-4){CS.d.forEach((a,j)=>a.set(CS.t[j]));CS.v.forEach(v=>v.fill(0));CS.moving=0}drawCharts()}
+function drawCharts(){plot('#c1',CS.d[0],'#ffb347','Shear force','kN',-1);plot('#c2',CS.d[1],'#3de0ff','Bending moment','kN·m',-1);plot('#c3',CS.d[2],'#b794ff','Deflection (down)','mm',1);secPlot()}
+
+/* ---------- charts ---------- */
+function plot(id,ys,col,ttl,unit,dir){const cv=$(id),w=cv.clientWidth,h=cv.clientHeight,g=cv.getContext('2d');cv.width=w*2;cv.height=h*2;g.scale(2,2);
+ const mx=Math.max(...ys.map(Math.abs),1e-12),pd=14,y0=h/2+6,X=i=>pd+i*(w-2*pd)/(NS-1),Y=v=>y0+dir*v/mx*(h/2-pd-6);
+ g.fillStyle='#091526';g.fillRect(0,0,w,h);g.strokeStyle='#2a4a72';g.beginPath();g.moveTo(pd,y0);g.lineTo(w-pd,y0);g.stroke();
+ g.beginPath();g.moveTo(X(0),y0);ys.forEach((v,i)=>g.lineTo(X(i),Y(v)));g.lineTo(X(NS-1),y0);g.fillStyle=col+'33';g.fill();
+ g.beginPath();ys.forEach((v,i)=>i?g.lineTo(X(i),Y(v)):g.moveTo(X(i),Y(v)));g.strokeStyle=col;g.lineWidth=1.8;g.stroke();
+ const ip=pi();g.strokeStyle='#ffd166';g.lineWidth=1;g.setLineDash([3,3]);g.beginPath();g.moveTo(X(ip),4);g.lineTo(X(ip),h-4);g.stroke();g.setLineDash([]);
+ g.fillStyle='#dce9f6';g.font='11px Segoe UI,sans-serif';g.fillText(`${ttl}: max ${fmt(mx)} ${unit}`,6,12);g.textAlign='right';g.fillStyle='#ffd166';g.fillText(`probe ${fmt(ys[ip])}`,w-6,12)}
+function secPlot(){const cv=$('#c4'),w=cv.clientWidth,h=cv.clientHeight,g=cv.getContext('2d');cv.width=w*2;cv.height=h*2;g.scale(2,2);
+ g.fillStyle='#091526';g.fillRect(0,0,w,h);
+ const c=cur.c,zm=Math.max(...cur.loops.flat().map(p=>Math.abs(p[1]))),sc=Math.min((h-40)/(2*c),w*.2/zm),cx=w*.2,cy=h/2+4;
+ g.beginPath();cur.loops.forEach(l=>{l.forEach((p,i)=>g[i?'lineTo':'moveTo'](cx+p[1]*sc,cy-p[0]*sc));g.closePath()});
+ g.fillStyle='#1f4172';g.fill('evenodd');g.strokeStyle='#3de0ff';g.lineWidth=1.4;g.stroke();
+ g.setLineDash([4,3]);g.strokeStyle='#84a0bd';g.beginPath();g.moveTo(8,cy);g.lineTo(w-8,cy);g.stroke();g.setLineDash([]);
+ const M=CS.d[1][pi()]*1e3,sl=Math.max(Math.abs(M)*c/cur.I,1e-9),x0=w*.62,W=w*.3;
+ for(let k=0;k<=24;k++){const y=c*(1-k/12),s=-M*y/cur.I;g.strokeStyle=s>0?'#ff4d5e':'#3de0ff';g.lineWidth=2.5;g.beginPath();g.moveTo(x0,cy-y*sc);g.lineTo(x0+s/sl*W,cy-y*sc);g.stroke()}
+ g.strokeStyle='#dce9f6';g.lineWidth=1;g.beginPath();g.moveTo(x0,cy-c*sc);g.lineTo(x0,cy+c*sc);g.stroke();
+ g.fillStyle='#dce9f6';g.font='11px Segoe UI,sans-serif';g.fillText('Section at probe x',6,12);g.fillText('N.A.',w-34,cy-4);
+ g.fillText(`top ${fmt(-M*c/cur.I/1e6)} MPa`,x0-40,cy-c*sc-4);g.fillText(`bottom ${fmt(M*c/cur.I/1e6)} MPa`,x0-40,cy+c*sc+13)}
+function panels(fl){const s=ST,i=pi(),e=cur;
+ $('#kpi').innerHTML=[['Max deflection',`${fmt(s.dmax*1e3)} mm at x = ${fmt(s.xd)} m`],['Max slope',`${fmt(s.thmax*57.2958)}°`],
+  ['Max bending moment',`${fmt(s.Mmax/1e3)} kN·m at ${fmt(s.xm)} m`],['Max shear force',`${fmt(s.Vmax/1e3)} kN`],
+  ['Max bending stress',`${fmt(s.smax/1e6)} MPa`],['Factor of safety',`<span class="${s.fos>=1?'ok':'bad'}">${isFinite(s.fos)?fmt(s.fos):'∞'} · ${s.fos>=1?'elastic':'YIELDS'}</span>`],
+  ['Shear modulus G',`${fmt(s.E/(2*(1+S.nu))/1e9)} GPa`],['I and Z',`${fmt(e.I*1e8)} cm⁴ · ${fmt(e.I/e.c*1e6)} cm³`],
+  ['Probe at x = '+fmt(S.probe)+' m',`δ ${fmt(s.ser.v[i]*1e3)} mm · V ${fmt(s.ser.V[i]/1e3)} kN · M ${fmt(s.ser.M[i]/1e3)} kN·m`]]
+  .map(([a,b],j)=>`<div class="k"${j==8?' style="grid-column:1/3"':''}><small>${a}</small><b>${b}</b></div>`).join('');
+ $('#rx').innerHTML=s.rea.map(r=>`x = ${fmt(r.x)} m → ${r.F?`R = ${fmt(r.F/1e3)} kN ↑`:`M = ${fmt(Math.abs(r.M)/1e3)} kN·m ${r.M<0?'↺':'↻'}`}`).join('<br>');
+ $('#l0').textContent='−'+fmt(s.smax/1e6)+' MPa';$('#l1').textContent='+'+fmt(s.smax/1e6)+' MPa';
+ const kp=$('#kpi');kp.classList.remove('f');if(fl){void kp.offsetWidth;kp.classList.add('f')}
+ setCharts();drawCharts()}
+
+/* ---------- control flow ---------- */
+function run(k){
+ if(light.includes(k)){syncUI();draw();if(k=='probe')panels();return}
+ if(k=='L'){const f=S.L/prevL;S.a*=f;S.probe*=f;R*=f}prevL=S.L;S.a=Math.min(S.a,S.L);S.probe=Math.min(S.probe,S.L);
+ el.a.max=el.probe.max=S.L;relabel();syncUI();solve();if(refit||k=='beam'||k=='sec'){kFix=ST.kAuto;refit=0}rebuild();buildLoads();buildEnv();draw();panels(1);cam()}
+function apply(o){Object.assign(S,o);if(o.mat)[S.E,S.nu,S.sy]=MAT[o.mat];prevL=S.L;R=1.2*S.L;refit=1;run('all')}
+window.FL={apply,S,grab(){R3.render(scene,camera);return gl.toDataURL()},set(k,v){S[k]=v;run(k)},get pos(){return pos},get tpos(){return tpos},get ST(){return ST}};
+Object.entries(SC).forEach(([n,o])=>{const b=document.createElement('button');b.textContent=n;b.onclick=()=>apply(o);$('#sc').appendChild(b)});
+const rb=document.createElement('button');rb.textContent='Replay loading';rb.onclick=()=>{anim=0};$('#sc').appendChild(rb);
+const fb=document.createElement('button');fb.textContent='Re-fit scale';fb.onclick=()=>{kFix=ST.kAuto;draw()};$('#sc').appendChild(fb);
+let shots=0;
+$('#shot').onclick=()=>{R3.render(scene,camera);const im=new Image();im.onload=()=>{const W=gl.width,H=gl.height,cw=W/3,ch=cw*.62,c=document.createElement('canvas');c.width=W;c.height=H+ch+36;
+ const g=c.getContext('2d');g.fillStyle='#071423';g.fillRect(0,0,c.width,c.height);g.drawImage(im,0,0);
+ ['#c1','#c2','#c3'].forEach((id,i)=>g.drawImage($(id),i*cw,H+32,cw,ch));g.fillStyle='#dce9f6';g.font=`${Math.max(12,W/70)}px sans-serif`;
+ g.fillText(`${$('#hud').innerText.split('\n')[0]}  |  M max ${fmt(ST.Mmax/1e3)} kN·m  |  σ max ${fmt(ST.smax/1e6)} MPa`,10,H+20);
+ const a=document.createElement('a');a.download=`beam_snapshot_${++shots}.png`;a.href=c.toDataURL();a.click()};im.src=gl.toDataURL()};
+new ResizeObserver(()=>{const v=$('#view');R3.setSize(v.clientWidth,v.clientHeight,false);camera.aspect=v.clientWidth/v.clientHeight;camera.updateProjectionMatrix();if(ST)panels()}).observe($('#view'));
+Object.assign(S,SC['Diving board']);R=1.2*S.L;run('all');
+(function loop(t){requestAnimationFrame(loop);const dt=Math.min((t-lt)/1000||.016,.033);lt=t;
+ tgtA=S.pulse?.5+.5*Math.sin(t/450):1;const n=anim+(tgtA-anim)*Math.min(1,dt*4.5);
+ if(Math.abs(n-anim)>1e-4||S.pulse){anim=n;draw()}
+ stepAll(dt);R3.render(scene,camera)})(0);
+</script></body></html>
